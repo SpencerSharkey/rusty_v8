@@ -1,12 +1,17 @@
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::marker::PhantomData;
 use std::mem::forget;
 use std::mem::transmute;
 use std::ops::Deref;
+use std::pin::Pin;
 use std::ptr::NonNull;
 
+use libc::c_void;
+
+use crate::support::Opaque;
 use crate::Data;
 use crate::HandleScope;
 use crate::Isolate;
@@ -15,7 +20,20 @@ use crate::IsolateHandle;
 extern "C" {
   fn v8__Local__New(isolate: *mut Isolate, other: *const Data) -> *const Data;
   fn v8__Global__New(isolate: *mut Isolate, data: *const Data) -> *const Data;
+  fn v8__Global__NewWeak(
+    isolate: *mut Isolate,
+    data: *const Data,
+    parameter: *const c_void,
+    callback: extern "C" fn(*const WeakCallbackInfo),
+  ) -> *const Data;
   fn v8__Global__Reset(data: *const Data);
+  fn v8__WeakCallbackInfo__GetParameter(
+    this: *const WeakCallbackInfo,
+  ) -> *mut c_void;
+  fn v8__WeakCallbackInfo__SetSecondPassCallback(
+    this: *const WeakCallbackInfo,
+    callback: extern "C" fn(*const WeakCallbackInfo),
+  );
 }
 
 /// An object reference managed by the v8 garbage collector.
@@ -437,3 +455,287 @@ impl HandleHost {
     unsafe { self.get_isolate().as_ref() }.thread_safe_handle()
   }
 }
+
+/// An object reference that does not prevent garbage collection for the object,
+/// and which allows installing finalization callbacks which will be called
+/// after the object has been GC'd.
+///
+/// Note that finalization callbacks are tied to the lifetime of a `Weak<T>`,
+/// and will not be called after the `Weak<T>` is dropped.
+///
+/// # `PartialEq` and `Hash`
+///
+/// The implementations of [`PartialEq`] and [`Hash`] might change during the
+/// lifetime of a `Weak<T>` instance: when compared via equals, a non-empty weak
+/// reference will not be equal to a different non-empty weak reference, but it
+/// will once both objects have been GC'd. Likewise, the hash of a weak
+/// reference will change after GC. That makes `Weak<T>` not suitable for use as
+/// the key for a [`HashMap`] or [`HashSet`].
+///
+/// # `Clone`
+///
+/// Since finalization callbacks are specific to a `Weak<T>` instance, cloning
+/// will create a new object reference without a finalizer, as if created by
+/// [`Self::new`]. You can use [`Self::clone_with_finalizer`] to attach a
+/// finalization callback to the clone.
+pub struct Weak<T> {
+  data: Option<Pin<Box<WeakData<T>>>>,
+  isolate_handle: IsolateHandle,
+}
+
+impl<T> Weak<T> {
+  pub fn new(isolate: &mut Isolate, handle: impl Handle<Data = T>) -> Self {
+    let HandleInfo { data, host } = handle.get_handle_info();
+    host.assert_match_isolate(isolate);
+    Self::new_raw(isolate, data, None)
+  }
+
+  /// Create a Weak handle with a finalization callback installed.
+  ///
+  /// NOTE: There is no guarantee as to *when* or even *if* the callback is
+  /// invoked. The invocation is performed solely on a best effort basis. As
+  /// always, GC-based finalization should *not* be relied upon for any critical
+  /// form of resource management!
+  ///
+  /// The finalizer does not have access to the inner value, because it has
+  /// already been GC'd by the time it runs.
+  pub fn with_finalizer(
+    isolate: &mut Isolate,
+    handle: impl Handle<Data = T>,
+    finalizer: Box<dyn FnOnce()>,
+  ) -> Self {
+    let HandleInfo { data, host } = handle.get_handle_info();
+    host.assert_match_isolate(isolate);
+    Self::new_raw(isolate, data, Some(finalizer))
+  }
+
+  fn new_raw(
+    isolate: *mut Isolate,
+    data: NonNull<T>,
+    finalizer: Option<Box<dyn FnOnce()>>,
+  ) -> Self {
+    let weak_data = Box::pin(WeakData {
+      pointer: Default::default(),
+      finalizer: Cell::new(finalizer),
+    });
+    let data = data.cast().as_ptr();
+    let data = unsafe {
+      v8__Global__NewWeak(
+        isolate,
+        data,
+        &weak_data as *const _ as *const c_void,
+        Self::first_pass_callback,
+      )
+    };
+    weak_data
+      .pointer
+      .set(Some(unsafe { NonNull::new_unchecked(data as *mut _) }));
+    Self {
+      data: Some(weak_data),
+      isolate_handle: unsafe { (*isolate).thread_safe_handle() },
+    }
+  }
+
+  pub fn empty(isolate: &mut Isolate) -> Self {
+    Weak {
+      data: None,
+      isolate_handle: isolate.thread_safe_handle(),
+    }
+  }
+
+  pub fn clone_with_finalizer(&self, finalizer: Box<dyn FnOnce()>) -> Self {
+    self.clone_raw(Some(finalizer))
+  }
+
+  fn clone_raw(&self, finalizer: Option<Box<dyn FnOnce()>>) -> Self {
+    if let Some(data) = self.get_pointer() {
+      Self::new_raw(
+        // SAFETY: We're in the isolate's thread.
+        unsafe { self.isolate_handle.get_isolate_ptr() },
+        data,
+        finalizer,
+      )
+    } else {
+      Weak {
+        data: None,
+        isolate_handle: self.isolate_handle.clone(),
+      }
+    }
+  }
+
+  fn get_pointer(&self) -> Option<NonNull<T>> {
+    self.data.as_ref().and_then(|data| data.pointer.get())
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.get_pointer().is_none()
+  }
+
+  pub fn open<'a>(&'a self, isolate: &mut Isolate) -> Option<&'a T> {
+    if let Some(data) = self.get_pointer() {
+      let handle_host: HandleHost = (&self.isolate_handle).into();
+      handle_host.assert_match_isolate(isolate);
+      Some(unsafe { &*data.as_ptr() })
+    } else {
+      None
+    }
+  }
+
+  pub fn as_global(&self, isolate: &mut Isolate) -> Option<Global<T>> {
+    if let Some(data) = self.get_pointer() {
+      let handle_host: HandleHost = (&self.isolate_handle).into();
+      handle_host.assert_match_isolate(isolate);
+      Some(unsafe { Global::new_raw(isolate, data) })
+    } else {
+      None
+    }
+  }
+
+  pub fn as_local<'s>(
+    &self,
+    scope: &mut HandleScope<'s, ()>,
+  ) -> Option<Local<'s, T>> {
+    if let Some(data) = self.get_pointer() {
+      let handle_host: HandleHost = (&self.isolate_handle).into();
+      handle_host.assert_match_isolate(scope);
+      let local = unsafe {
+        scope.cast_local(|sd| {
+          v8__Local__New(sd.get_isolate_ptr(), data.cast().as_ptr()) as *const T
+        })
+      };
+      Some(local.unwrap())
+    } else {
+      None
+    }
+  }
+
+  // Finalization callbacks.
+  // TODO: These functions depend on T, but always behind a pointer. Make sure
+  // they're not monomorphized.
+
+  extern "C" fn first_pass_callback(wci: *const WeakCallbackInfo) {
+    // SAFETY: If this callback is called, then the weak handle hasn't been
+    // reset, which means the `Weak` instance which owns the pinned box that the
+    // parameter points to hasn't been dropped.
+    let weak_data = unsafe {
+      let ptr = v8__WeakCallbackInfo__GetParameter(wci);
+      &*(ptr as *mut WeakData<T>)
+    };
+
+    if let Some(data) = weak_data.pointer.take() {
+      unsafe { v8__Global__Reset(data.cast().as_ptr()) };
+    } else {
+      unreachable!();
+    }
+
+    // Only set the second pass callback if there's a finalizer.
+    if let Some(finalizer) = weak_data.finalizer.take() {
+      weak_data.finalizer.set(Some(finalizer));
+      unsafe {
+        v8__WeakCallbackInfo__SetSecondPassCallback(
+          wci,
+          Self::second_pass_callback,
+        )
+      };
+    }
+  }
+
+  extern "C" fn second_pass_callback(wci: *const WeakCallbackInfo) {
+    // FIXME!!!!: Do we know for a fact that the parameter hasn't been dropped??
+    let weak_data = unsafe {
+      let ptr = v8__WeakCallbackInfo__GetParameter(wci);
+      &*(ptr as *mut WeakData<T>)
+    };
+    if let Some(finalizer) = weak_data.finalizer.take() {
+      finalizer();
+    }
+  }
+}
+
+impl<T> Clone for Weak<T> {
+  fn clone(&self) -> Self {
+    self.clone_raw(None)
+  }
+}
+
+impl<T> Drop for Weak<T> {
+  fn drop(&mut self) {
+    unsafe {
+      if self.isolate_handle.get_isolate_ptr().is_null() {
+        // This weak handle is associated with an `Isolate` that has already been
+        // disposed.
+      } else if let Some(data) = self.get_pointer() {
+        v8__Global__Reset(data.cast().as_ptr())
+      }
+    }
+  }
+}
+
+impl<T> Eq for Weak<T> where T: Eq {}
+
+impl<T, Rhs: Handle> PartialEq<Rhs> for Weak<T>
+where
+  T: PartialEq<Rhs::Data>,
+{
+  fn eq(&self, other: &Rhs) -> bool {
+    let HandleInfo {
+      data: other_data,
+      host: other_host,
+    } = other.get_handle_info();
+    let self_host: HandleHost = (&self.isolate_handle).into();
+    if !self_host.match_host(other_host, None) {
+      false
+    } else if let Some(self_data) = self.get_pointer() {
+      unsafe { self_data.as_ref() == other_data.as_ref() }
+    } else {
+      false
+    }
+  }
+}
+
+impl<T, T2> PartialEq<Weak<T2>> for Weak<T>
+where
+  T: PartialEq<T2>,
+{
+  fn eq(&self, other: &Weak<T2>) -> bool {
+    let self_host: HandleHost = (&self.isolate_handle).into();
+    let other_host: HandleHost = (&other.isolate_handle).into();
+    if !self_host.match_host(other_host, None) {
+      return false;
+    }
+    match (self.get_pointer(), other.get_pointer()) {
+      (Some(self_data), Some(other_data)) => unsafe {
+        self_data.as_ref() == other_data.as_ref()
+      },
+      (None, None) => true,
+      _ => false,
+    }
+  }
+}
+
+impl<T: Hash> Hash for Weak<T> {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    unsafe {
+      if self.isolate_handle.get_isolate_ptr().is_null() {
+        panic!("can't hash Weak after its host Isolate has been disposed");
+      }
+      if let Some(data) = self.get_pointer() {
+        data.as_ref().hash(state);
+      }
+    }
+  }
+}
+
+/// The inner mechanism behind [`Weak`] and finalizations.
+///
+/// This struct is pinned on the heap so it's guaranteed not to move until the
+/// [`Weak`] is dropped. It's owned by the [`Weak`], but it's also accessible
+/// to the finalization callbacks, which can read and modify the pointer and the
+/// finalizer function (which is why they are wrapped in [`Cell`]).
+struct WeakData<T> {
+  pointer: Cell<Option<NonNull<T>>>,
+  finalizer: Cell<Option<Box<dyn FnOnce()>>>,
+}
+
+#[repr(C)]
+struct WeakCallbackInfo(Opaque);
