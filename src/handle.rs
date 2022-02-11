@@ -6,7 +6,6 @@ use std::marker::PhantomData;
 use std::mem::forget;
 use std::mem::transmute;
 use std::ops::Deref;
-use std::pin::Pin;
 use std::ptr::NonNull;
 
 use libc::c_void;
@@ -463,23 +462,15 @@ impl HandleHost {
 /// Note that finalization callbacks are tied to the lifetime of a `Weak<T>`,
 /// and will not be called after the `Weak<T>` is dropped.
 ///
-/// # `PartialEq` and `Hash`
-///
-/// The implementations of [`PartialEq`] and [`Hash`] might change during the
-/// lifetime of a `Weak<T>` instance: when compared via equals, a non-empty weak
-/// reference will not be equal to a different non-empty weak reference, but it
-/// will once both objects have been GC'd. Likewise, the hash of a weak
-/// reference will change after GC. That makes `Weak<T>` not suitable for use as
-/// the key for a [`HashMap`] or [`HashSet`].
-///
 /// # `Clone`
 ///
 /// Since finalization callbacks are specific to a `Weak<T>` instance, cloning
 /// will create a new object reference without a finalizer, as if created by
 /// [`Self::new`]. You can use [`Self::clone_with_finalizer`] to attach a
 /// finalization callback to the clone.
+#[derive(Debug)]
 pub struct Weak<T> {
-  data: Option<Pin<Box<WeakData<T>>>>,
+  data: Option<Box<WeakData<T>>>,
   isolate_handle: IsolateHandle,
 }
 
@@ -490,15 +481,15 @@ impl<T> Weak<T> {
     Self::new_raw(isolate, data, None)
   }
 
-  /// Create a Weak handle with a finalization callback installed.
+  /// Create a weak handle with a finalization callback installed.
   ///
   /// NOTE: There is no guarantee as to *when* or even *if* the callback is
   /// invoked. The invocation is performed solely on a best effort basis. As
   /// always, GC-based finalization should *not* be relied upon for any critical
   /// form of resource management!
   ///
-  /// The finalizer does not have access to the inner value, because it has
-  /// already been GC'd by the time it runs.
+  /// The callback does not have access to the inner value, because it has
+  /// already been collected by the time it runs.
   pub fn with_finalizer(
     isolate: &mut Isolate,
     handle: impl Handle<Data = T>,
@@ -514,7 +505,7 @@ impl<T> Weak<T> {
     data: NonNull<T>,
     finalizer: Option<Box<dyn FnOnce()>>,
   ) -> Self {
-    let weak_data = Box::pin(WeakData {
+    let weak_data = Box::new(WeakData {
       pointer: Default::default(),
       finalizer: Cell::new(finalizer),
     });
@@ -523,7 +514,7 @@ impl<T> Weak<T> {
       v8__Global__NewWeak(
         isolate,
         data,
-        &weak_data as *const _ as *const c_void,
+        weak_data.deref() as *const _ as *const c_void,
         Self::first_pass_callback,
       )
     };
@@ -536,6 +527,8 @@ impl<T> Weak<T> {
     }
   }
 
+  /// Creates a new empty handle, identical to one for an object that has
+  /// already been GC'd.
   pub fn empty(isolate: &mut Isolate) -> Self {
     Weak {
       data: None,
@@ -543,6 +536,11 @@ impl<T> Weak<T> {
     }
   }
 
+  /// Clones this handle and installs a finalizer callback on the clone, as if
+  /// by calling [`Self::with_finalizer`].
+  ///
+  /// Note that if this handle is empty (its value has already been GC'd), the
+  /// finalization callback will never run.
   pub fn clone_with_finalizer(&self, finalizer: Box<dyn FnOnce()>) -> Self {
     self.clone_raw(Some(finalizer))
   }
@@ -550,7 +548,8 @@ impl<T> Weak<T> {
   fn clone_raw(&self, finalizer: Option<Box<dyn FnOnce()>>) -> Self {
     if let Some(data) = self.get_pointer() {
       Self::new_raw(
-        // SAFETY: We're in the isolate's thread.
+        // SAFETY: We're in the isolate's thread, because Weak<T> isn't Send or
+        // Sync.
         unsafe { self.isolate_handle.get_isolate_ptr() },
         data,
         finalizer,
@@ -665,7 +664,7 @@ impl<T> Drop for Weak<T> {
         // This weak handle is associated with an `Isolate` that has already been
         // disposed.
       } else if let Some(data) = self.get_pointer() {
-        v8__Global__Reset(data.cast().as_ptr())
+        v8__Global__Reset(data.cast().as_ptr());
       }
     }
   }
@@ -713,19 +712,6 @@ where
   }
 }
 
-impl<T: Hash> Hash for Weak<T> {
-  fn hash<H: Hasher>(&self, state: &mut H) {
-    unsafe {
-      if self.isolate_handle.get_isolate_ptr().is_null() {
-        panic!("can't hash Weak after its host Isolate has been disposed");
-      }
-      if let Some(data) = self.get_pointer() {
-        data.as_ref().hash(state);
-      }
-    }
-  }
-}
-
 /// The inner mechanism behind [`Weak`] and finalizations.
 ///
 /// This struct is pinned on the heap so it's guaranteed not to move until the
@@ -735,6 +721,14 @@ impl<T: Hash> Hash for Weak<T> {
 struct WeakData<T> {
   pointer: Cell<Option<NonNull<T>>>,
   finalizer: Cell<Option<Box<dyn FnOnce()>>>,
+}
+
+impl<T> std::fmt::Debug for WeakData<T> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("WeakData")
+      .field("pointer", &self.pointer)
+      .finish_non_exhaustive()
+  }
 }
 
 #[repr(C)]

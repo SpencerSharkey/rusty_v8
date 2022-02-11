@@ -6214,3 +6214,94 @@ fn instance_of() {
 
   assert!(array.instance_of(&mut scope, array_constructor).unwrap());
 }
+#[test]
+fn weak_handle() {
+  use std::ops::Deref;
+
+  let _setup_guard = setup();
+
+  let mut isolate = v8::Isolate::new(Default::default());
+  let mut scope = v8::HandleScope::new(&mut isolate);
+  let context = v8::Context::new(&mut scope);
+  let mut scope = v8::ContextScope::new(&mut scope, context);
+  let weak = {
+    let scope = &mut v8::HandleScope::new(&mut scope);
+    let local = v8::Object::new(scope);
+
+    let weak = v8::Weak::new(scope, &local);
+    assert!(!weak.is_empty());
+    assert_eq!(weak, local);
+    assert_eq!(weak.open(scope), Some(local.deref()));
+
+    weak
+  };
+
+  let scope = &mut v8::HandleScope::new(&mut scope);
+
+  eval(scope, "gc()").unwrap();
+
+  assert!(weak.is_empty());
+  assert_eq!(weak.open(scope), None);
+}
+
+#[test]
+fn finalizers() {
+  use std::cell::Cell;
+  use std::ops::Deref;
+
+  let _setup_guard = setup();
+
+  let mut isolate = v8::Isolate::new(Default::default());
+  let mut scope = v8::HandleScope::new(&mut isolate);
+  let context = v8::Context::new(&mut scope);
+  let mut scope = v8::ContextScope::new(&mut scope, context);
+
+  // The finalizer for a dropped Weak is never called.
+  {
+    {
+      let scope = &mut v8::HandleScope::new(&mut scope);
+      let local = v8::Object::new(scope);
+      let _ =
+        v8::Weak::with_finalizer(scope, &local, Box::new(|| unreachable!()));
+    }
+
+    let scope = &mut v8::HandleScope::new(&mut scope);
+    eval(scope, "gc()").unwrap();
+  }
+
+  let finalizer_called = Arc::new(Cell::new(false));
+  let weak = {
+    let scope = &mut v8::HandleScope::new(&mut scope);
+    let local = v8::Object::new(scope);
+
+    // We use a channel to send data into the finalizer without having to worry
+    // about lifetimes.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(
+      Arc<v8::Weak<v8::Object>>,
+      Arc<Cell<bool>>,
+    )>(1);
+
+    let weak = Arc::new(v8::Weak::with_finalizer(
+      scope,
+      &local,
+      Box::new(move || {
+        let (weak, finalizer_called) = rx.try_recv().unwrap();
+        finalizer_called.set(true);
+        assert!(weak.is_empty());
+      }),
+    ));
+
+    tx.send((weak.clone(), finalizer_called.clone())).unwrap();
+
+    assert!(!weak.is_empty());
+    assert_eq!(weak.deref(), &local);
+    assert_eq!(weak.open(scope), Some(local.deref()));
+
+    weak
+  };
+
+  let scope = &mut v8::HandleScope::new(&mut scope);
+  eval(scope, "gc()").unwrap();
+  assert!(weak.is_empty());
+  assert!(finalizer_called.get());
+}
