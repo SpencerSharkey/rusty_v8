@@ -563,7 +563,17 @@ impl<T> Weak<T> {
   }
 
   fn get_pointer(&self) -> Option<NonNull<T>> {
-    self.data.as_ref().and_then(|data| data.pointer.get())
+    if let Some(data) = &self.data {
+      // It seems like when the isolate is dropped, even the first pass callback
+      // might not be called.
+      if unsafe { self.isolate_handle.get_isolate_ptr() }.is_null() {
+        None
+      } else {
+        data.pointer.get()
+      }
+    } else {
+      None
+    }
   }
 
   pub fn is_empty(&self) -> bool {
@@ -660,10 +670,7 @@ impl<T> Clone for Weak<T> {
 impl<T> Drop for Weak<T> {
   fn drop(&mut self) {
     unsafe {
-      if self.isolate_handle.get_isolate_ptr().is_null() {
-        // This weak handle is associated with an `Isolate` that has already been
-        // disposed.
-      } else if let Some(data) = self.get_pointer() {
+      if let Some(data) = self.get_pointer() {
         v8__Global__Reset(data.cast().as_ptr());
       }
     }

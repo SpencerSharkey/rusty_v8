@@ -6248,6 +6248,7 @@ fn weak_handle() {
 fn finalizers() {
   use std::cell::Cell;
   use std::ops::Deref;
+  use std::rc::Rc;
 
   let _setup_guard = setup();
 
@@ -6269,7 +6270,7 @@ fn finalizers() {
     eval(scope, "gc()").unwrap();
   }
 
-  let finalizer_called = Arc::new(Cell::new(false));
+  let finalizer_called = Rc::new(Cell::new(false));
   let weak = {
     let scope = &mut v8::HandleScope::new(&mut scope);
     let local = v8::Object::new(scope);
@@ -6277,11 +6278,11 @@ fn finalizers() {
     // We use a channel to send data into the finalizer without having to worry
     // about lifetimes.
     let (tx, rx) = std::sync::mpsc::sync_channel::<(
-      Arc<v8::Weak<v8::Object>>,
-      Arc<Cell<bool>>,
+      Rc<v8::Weak<v8::Object>>,
+      Rc<Cell<bool>>,
     )>(1);
 
-    let weak = Arc::new(v8::Weak::with_finalizer(
+    let weak = Rc::new(v8::Weak::with_finalizer(
       scope,
       &local,
       Box::new(move || {
@@ -6304,4 +6305,27 @@ fn finalizers() {
   eval(scope, "gc()").unwrap();
   assert!(weak.is_empty());
   assert!(finalizer_called.get());
+}
+
+#[test]
+fn weak_is_empty_after_dropping_isolate() {
+  let _setup_guard = setup();
+
+  let weak = {
+    let mut isolate = v8::Isolate::new(Default::default());
+    let mut scope = v8::HandleScope::new(&mut isolate);
+    let context = v8::Context::new(&mut scope);
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+
+    let global = {
+      let object = v8::Object::new(scope);
+      v8::Global::new(scope, object)
+    };
+    let weak = v8::Weak::new(scope, &global);
+    assert!(!weak.is_empty());
+
+    weak
+  };
+
+  assert!(weak.is_empty());
 }
