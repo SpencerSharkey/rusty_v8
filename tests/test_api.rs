@@ -6309,6 +6309,30 @@ fn finalizers() {
 }
 
 #[test]
+fn weak_from_global() {
+  let _setup_guard = setup();
+
+  let isolate = &mut v8::Isolate::new(Default::default());
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  let global = {
+    let scope = &mut v8::HandleScope::new(scope);
+    let object = v8::Object::new(scope);
+    v8::Global::new(scope, object)
+  };
+
+  let weak = v8::Weak::new(scope, &global);
+  assert!(!weak.is_empty());
+  assert_eq!(weak.open(scope).unwrap(), global.open(scope));
+
+  drop(global);
+  eval(scope, "gc()").unwrap();
+  assert!(weak.is_empty());
+}
+
+#[test]
 fn weak_is_empty_after_dropping_isolate() {
   let _setup_guard = setup();
 
