@@ -6220,12 +6220,13 @@ fn weak_handle() {
 
   let _setup_guard = setup();
 
-  let mut isolate = v8::Isolate::new(Default::default());
-  let mut scope = v8::HandleScope::new(&mut isolate);
-  let context = v8::Context::new(&mut scope);
-  let mut scope = v8::ContextScope::new(&mut scope, context);
+  let isolate = &mut v8::Isolate::new(Default::default());
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
+
   let weak = {
-    let scope = &mut v8::HandleScope::new(&mut scope);
+    let scope = &mut v8::HandleScope::new(scope);
     let local = v8::Object::new(scope);
 
     let weak = v8::Weak::new(scope, &local);
@@ -6236,7 +6237,7 @@ fn weak_handle() {
     weak
   };
 
-  let scope = &mut v8::HandleScope::new(&mut scope);
+  let scope = &mut v8::HandleScope::new(scope);
 
   eval(scope, "gc()").unwrap();
 
@@ -6252,27 +6253,27 @@ fn finalizers() {
 
   let _setup_guard = setup();
 
-  let mut isolate = v8::Isolate::new(Default::default());
-  let mut scope = v8::HandleScope::new(&mut isolate);
-  let context = v8::Context::new(&mut scope);
-  let mut scope = v8::ContextScope::new(&mut scope, context);
+  let isolate = &mut v8::Isolate::new(Default::default());
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
 
   // The finalizer for a dropped Weak is never called.
   {
     {
-      let scope = &mut v8::HandleScope::new(&mut scope);
+      let scope = &mut v8::HandleScope::new(scope);
       let local = v8::Object::new(scope);
       let _ =
         v8::Weak::with_finalizer(scope, &local, Box::new(|| unreachable!()));
     }
 
-    let scope = &mut v8::HandleScope::new(&mut scope);
+    let scope = &mut v8::HandleScope::new(scope);
     eval(scope, "gc()").unwrap();
   }
 
   let finalizer_called = Rc::new(Cell::new(false));
   let weak = {
-    let scope = &mut v8::HandleScope::new(&mut scope);
+    let scope = &mut v8::HandleScope::new(scope);
     let local = v8::Object::new(scope);
 
     // We use a channel to send data into the finalizer without having to worry
@@ -6301,7 +6302,7 @@ fn finalizers() {
     weak
   };
 
-  let scope = &mut v8::HandleScope::new(&mut scope);
+  let scope = &mut v8::HandleScope::new(scope);
   eval(scope, "gc()").unwrap();
   assert!(weak.is_empty());
   assert!(finalizer_called.get());
@@ -6312,10 +6313,10 @@ fn weak_is_empty_after_dropping_isolate() {
   let _setup_guard = setup();
 
   let weak = {
-    let mut isolate = v8::Isolate::new(Default::default());
-    let mut scope = v8::HandleScope::new(&mut isolate);
-    let context = v8::Context::new(&mut scope);
-    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = &mut v8::HandleScope::new(isolate);
+    let context = v8::Context::new(scope);
+    let scope = &mut v8::ContextScope::new(scope, context);
 
     let global = {
       let object = v8::Object::new(scope);
