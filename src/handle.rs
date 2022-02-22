@@ -580,17 +580,7 @@ impl<T> Weak<T> {
     self.get_pointer().is_none()
   }
 
-  pub fn open<'a>(&'a self, isolate: &mut Isolate) -> Option<&'a T> {
-    if let Some(data) = self.get_pointer() {
-      let handle_host: HandleHost = (&self.isolate_handle).into();
-      handle_host.assert_match_isolate(isolate);
-      Some(unsafe { &*data.as_ptr() })
-    } else {
-      None
-    }
-  }
-
-  pub fn as_global(&self, isolate: &mut Isolate) -> Option<Global<T>> {
+  pub fn to_global(&self, isolate: &mut Isolate) -> Option<Global<T>> {
     if let Some(data) = self.get_pointer() {
       let handle_host: HandleHost = (&self.isolate_handle).into();
       handle_host.assert_match_isolate(isolate);
@@ -600,7 +590,7 @@ impl<T> Weak<T> {
     }
   }
 
-  pub fn as_local<'s>(
+  pub fn to_local<'s>(
     &self,
     scope: &mut HandleScope<'s, ()>,
   ) -> Option<Local<'s, T>> {
@@ -631,10 +621,9 @@ impl<T> Weak<T> {
       &*(ptr as *mut WeakData<T>)
     };
 
-    if let Some(data) = weak_data.pointer.take() {
-      unsafe { v8__Global__Reset(data.cast().as_ptr()) };
-    } else {
-      unreachable!();
+    let data = weak_data.pointer.take().unwrap();
+    unsafe {
+      v8__Global__Reset(data.cast().as_ptr());
     }
 
     // Only set the second pass callback if there's a finalizer.

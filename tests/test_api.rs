@@ -6216,8 +6216,6 @@ fn instance_of() {
 }
 #[test]
 fn weak_handle() {
-  use std::ops::Deref;
-
   let _setup_guard = setup();
 
   let isolate = &mut v8::Isolate::new(Default::default());
@@ -6232,7 +6230,7 @@ fn weak_handle() {
     let weak = v8::Weak::new(scope, &local);
     assert!(!weak.is_empty());
     assert_eq!(weak, local);
-    assert_eq!(weak.open(scope), Some(local.deref()));
+    assert_eq!(weak.to_local(scope), Some(local));
 
     weak
   };
@@ -6242,7 +6240,7 @@ fn weak_handle() {
   eval(scope, "gc()").unwrap();
 
   assert!(weak.is_empty());
-  assert_eq!(weak.open(scope), None);
+  assert_eq!(weak.to_local(scope), None);
 }
 
 #[test]
@@ -6297,7 +6295,7 @@ fn finalizers() {
 
     assert!(!weak.is_empty());
     assert_eq!(weak.deref(), &local);
-    assert_eq!(weak.open(scope), Some(local.deref()));
+    assert_eq!(weak.to_local(scope), Some(local));
 
     weak
   };
@@ -6325,7 +6323,7 @@ fn weak_from_global() {
 
   let weak = v8::Weak::new(scope, &global);
   assert!(!weak.is_empty());
-  assert_eq!(weak.open(scope).unwrap(), global.open(scope));
+  assert_eq!(weak.to_global(scope).unwrap(), global);
 
   drop(global);
   eval(scope, "gc()").unwrap();
