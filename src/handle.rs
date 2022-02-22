@@ -508,6 +508,7 @@ impl<T> Weak<T> {
     let weak_data = Box::new(WeakData {
       pointer: Default::default(),
       finalizer: Cell::new(finalizer),
+      weak_dropped: Cell::new(false),
     });
     let data = data.cast().as_ptr();
     let data = unsafe {
@@ -609,8 +610,6 @@ impl<T> Weak<T> {
   }
 
   // Finalization callbacks.
-  // TODO: These functions depend on T, but always behind a pointer. Make sure
-  // they're not monomorphized.
 
   extern "C" fn first_pass_callback(wci: *const WeakCallbackInfo) {
     // SAFETY: If this callback is called, then the weak handle hasn't been
@@ -639,13 +638,25 @@ impl<T> Weak<T> {
   }
 
   extern "C" fn second_pass_callback(wci: *const WeakCallbackInfo) {
-    // FIXME!!!!: Do we know for a fact that the parameter hasn't been dropped??
+    // SAFETY: This callback might be called well after the first pass callback,
+    // which means the corresponding Weak might have been dropped. In Weak's
+    // Drop impl we make sure that if the second pass callback hasn't yet run, the
+    // Box<WeakData<T>> is leaked, so it will still be alive by the time this
+    // callback is called.
     let weak_data = unsafe {
       let ptr = v8__WeakCallbackInfo__GetParameter(wci);
       &*(ptr as *mut WeakData<T>)
     };
     if let Some(finalizer) = weak_data.finalizer.take() {
       finalizer();
+    }
+
+    if weak_data.weak_dropped.get() {
+      // SAFETY: If weak_dropped is true, the corresponding Weak has been dropped,
+      // so it's safe to take ownership of the Box<WeakData<T>> and drop it.
+      let _ = unsafe {
+        Box::from_raw(weak_data as *const WeakData<T> as *mut WeakData<T>)
+      };
     }
   }
 }
@@ -660,7 +671,18 @@ impl<T> Drop for Weak<T> {
   fn drop(&mut self) {
     unsafe {
       if let Some(data) = self.get_pointer() {
+        // If the pointer is not None, the first pass callback hasn't been
+        // called yet, and resetting will prevent it from being called.
         v8__Global__Reset(data.cast().as_ptr());
+      } else if let Some(weak_data) = self.data.take() {
+        // The second pass callback takes the finalizer, so if there is one,
+        // the second pass hasn't yet run, and WeakData will have to be alive.
+        let finalizer = weak_data.finalizer.take();
+        if finalizer.is_some() {
+          weak_data.finalizer.set(finalizer);
+          weak_data.weak_dropped.set(true);
+          Box::leak(weak_data);
+        }
       }
     }
   }
@@ -710,13 +732,14 @@ where
 
 /// The inner mechanism behind [`Weak`] and finalizations.
 ///
-/// This struct is pinned on the heap so it's guaranteed not to move until the
-/// [`Weak`] is dropped. It's owned by the [`Weak`], but it's also accessible
-/// to the finalization callbacks, which can read and modify the pointer and the
-/// finalizer function (which is why they are wrapped in [`Cell`]).
+/// This struct is heap-allocated and will not move until it's dropped, so it
+/// can be accessed by the finalization callbacks by creating a shared reference
+/// from a pointer. The fields are wrapped in [`Cell`] so they are modifiable by
+/// both the [`Weak`] and the finalization callbacks.
 struct WeakData<T> {
   pointer: Cell<Option<NonNull<T>>>,
   finalizer: Cell<Option<Box<dyn FnOnce()>>>,
+  weak_dropped: Cell<bool>,
 }
 
 impl<T> std::fmt::Debug for WeakData<T> {
