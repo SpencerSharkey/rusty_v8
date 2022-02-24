@@ -563,6 +563,55 @@ impl<T> Weak<T> {
     }
   }
 
+  /// Converts an optional raw pointer created with [`Weak::into_raw()`] back to
+  /// its original `Weak`.
+  ///
+  /// This method is called with `Some`, the pointer is invalidated and it
+  /// cannot be used with this method again. Additionally, it is unsound to call
+  /// this method with an isolate other than that in which the original `Weak`
+  /// was created.
+  pub unsafe fn from_raw(
+    isolate: &mut Isolate,
+    data: Option<NonNull<WeakData<T>>>,
+  ) -> Self {
+    Weak {
+      data: data.map(|raw| Box::from_raw(raw.cast().as_ptr())),
+      isolate_handle: isolate.thread_safe_handle(),
+    }
+  }
+
+  /// Consume this `Weak` handle and return the underlying raw pointer, or
+  /// `None` if the value has been GC'd.
+  ///
+  /// The return value can be converted back into a `Weak` by using
+  /// [`Weak::from_raw`]. Note that `Weak` allocates some memory, and if this
+  /// method returns `Some`, the pointer must be converted back into a `Weak`
+  /// for it to be freed.
+  ///
+  /// Note that this method might return `Some` even after the V8 value has been
+  /// GC'd.
+  pub fn into_raw(mut self) -> Option<NonNull<WeakData<T>>> {
+    if let Some(data) = self.data.take() {
+      let has_finalizer = {
+        let finalizer = data.finalizer.take();
+        let has_finalizer = finalizer.is_some();
+        data.finalizer.set(finalizer);
+        has_finalizer
+      };
+
+      if data.pointer.get().is_none() && !has_finalizer {
+        // If the pointer is None and we're not waiting for the second pass,
+        // drop the box and return None.
+        None
+      } else {
+        assert!(!data.weak_dropped.get());
+        Some(unsafe { NonNull::new_unchecked(Box::into_raw(data)) })
+      }
+    } else {
+      None
+    }
+  }
+
   fn get_pointer(&self) -> Option<NonNull<T>> {
     if let Some(data) = &self.data {
       // It seems like when the isolate is dropped, even the first pass callback
@@ -736,7 +785,7 @@ where
 /// can be accessed by the finalization callbacks by creating a shared reference
 /// from a pointer. The fields are wrapped in [`Cell`] so they are modifiable by
 /// both the [`Weak`] and the finalization callbacks.
-struct WeakData<T> {
+pub struct WeakData<T> {
   pointer: Cell<Option<NonNull<T>>>,
   finalizer: Cell<Option<Box<dyn FnOnce()>>>,
   weak_dropped: Cell<bool>,

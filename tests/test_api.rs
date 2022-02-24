@@ -6352,3 +6352,102 @@ fn weak_is_empty_after_dropping_isolate() {
 
   assert!(weak.is_empty());
 }
+
+#[test]
+fn weak_from_into_raw() {
+  use std::cell::Cell;
+  use std::rc::Rc;
+
+  let _setup_guard = setup();
+
+  let isolate = &mut v8::Isolate::new(Default::default());
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  let finalizer_called = Rc::new(Cell::new(false));
+
+  assert_eq!(v8::Weak::<v8::Object>::empty(scope).into_raw(), None);
+  assert!(unsafe { v8::Weak::<v8::Object>::from_raw(scope, None) }.is_empty());
+
+  // regular back and forth
+  {
+    finalizer_called.take();
+    let (weak1, weak2) = {
+      let scope = &mut v8::HandleScope::new(scope);
+      let local = v8::Object::new(scope);
+      let weak = v8::Weak::new(scope, &local);
+      let weak_with_finalizer = v8::Weak::with_finalizer(
+        scope,
+        &local,
+        Box::new({
+          let finalizer_called = finalizer_called.clone();
+          move || {
+            finalizer_called.set(true);
+          }
+        }),
+      );
+      let raw1 = weak.into_raw();
+      let raw2 = weak_with_finalizer.into_raw();
+      assert!(raw1.is_some());
+      assert!(raw2.is_some());
+      let weak1 = unsafe { v8::Weak::from_raw(scope, raw1) };
+      let weak2 = unsafe { v8::Weak::from_raw(scope, raw2) };
+      assert_eq!(weak1.to_local(scope), Some(local));
+      assert_eq!(weak2.to_local(scope), Some(local));
+      assert!(!finalizer_called.get());
+      (weak1, weak2)
+    };
+    eval(scope, "gc()").unwrap();
+    assert!(weak1.is_empty());
+    assert!(weak2.is_empty());
+    assert!(finalizer_called.get());
+  }
+
+  // into_raw from a GC'd pointer
+  {
+    let weak = {
+      let scope = &mut v8::HandleScope::new(scope);
+      let local = v8::Object::new(scope);
+      v8::Weak::new(scope, &local)
+    };
+    assert!(!weak.is_empty());
+    eval(scope, "gc()").unwrap();
+    assert!(weak.is_empty());
+    assert_eq!(weak.into_raw(), None);
+  }
+
+  // It's fine if there's a GC while the Weak is leaked.
+  {
+    finalizer_called.take();
+    let (weak, weak_with_finalizer) = {
+      let scope = &mut v8::HandleScope::new(scope);
+      let local = v8::Object::new(scope);
+      let weak = v8::Weak::new(scope, &local);
+      let weak_with_finalizer = v8::Weak::with_finalizer(
+        scope,
+        &local,
+        Box::new({
+          let finalizer_called = finalizer_called.clone();
+          move || {
+            finalizer_called.set(true);
+          }
+        }),
+      );
+      (weak, weak_with_finalizer)
+    };
+    assert!(!weak.is_empty());
+    assert!(!weak_with_finalizer.is_empty());
+    assert!(!finalizer_called.get());
+    let raw1 = weak.into_raw();
+    let raw2 = weak_with_finalizer.into_raw();
+    assert!(raw1.is_some());
+    assert!(raw2.is_some());
+    eval(scope, "gc()").unwrap();
+    assert!(finalizer_called.get());
+    let weak1 = unsafe { v8::Weak::from_raw(scope, raw1) };
+    let weak2 = unsafe { v8::Weak::from_raw(scope, raw2) };
+    assert!(weak1.is_empty());
+    assert!(weak2.is_empty());
+  }
+}
