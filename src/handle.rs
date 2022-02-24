@@ -658,6 +658,12 @@ impl<T> Weak<T> {
     }
   }
 
+  pub fn unset_finalizer(&mut self) {
+    if let Some(data) = &self.data {
+      data.finalizer.take();
+    }
+  }
+
   // Finalization callbacks.
 
   extern "C" fn first_pass_callback(wci: *const WeakCallbackInfo) {

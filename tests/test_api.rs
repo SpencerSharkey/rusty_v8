@@ -6269,6 +6269,18 @@ fn finalizers() {
     eval(scope, "gc()").unwrap();
   }
 
+  // unset_finalizer
+  {
+    let mut weak = {
+      let scope = &mut v8::HandleScope::new(scope);
+      let local = v8::Object::new(scope);
+      v8::Weak::with_finalizer(scope, &local, Box::new(|| unreachable!()))
+    };
+    weak.unset_finalizer();
+    eval(scope, "gc()").unwrap();
+    assert!(weak.is_empty());
+  }
+
   let finalizer_called = Rc::new(Cell::new(false));
   let weak = {
     let scope = &mut v8::HandleScope::new(scope);
