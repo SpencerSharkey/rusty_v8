@@ -634,7 +634,7 @@ impl<T> Weak<T> {
     if let Some(data) = self.get_pointer() {
       let handle_host: HandleHost = (&self.isolate_handle).into();
       handle_host.assert_match_isolate(isolate);
-      Some(unsafe { Global::from_raw(isolate, data) })
+      Some(unsafe { Global::new_raw(isolate, data) })
     } else {
       None
     }
