@@ -136,6 +136,39 @@ fn global_handles() {
 }
 
 #[test]
+fn global_from_into_raw() {
+  let _setup_guard = setup();
+
+  let isolate = &mut v8::Isolate::new(Default::default());
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  let (raw, weak) = {
+    let scope = &mut v8::HandleScope::new(scope);
+    let local = v8::Object::new(scope);
+    let global = v8::Global::new(scope, local);
+
+    let weak = v8::Weak::new(scope, &global);
+    let raw = global.into_raw();
+    (raw, weak)
+  };
+
+  eval(scope, "gc()").unwrap();
+  assert!(!weak.is_empty());
+
+  {
+    let reconstructed = unsafe { v8::Global::from_raw(scope, raw) };
+
+    let global_from_weak = weak.to_global(scope).unwrap();
+    assert_eq!(global_from_weak, reconstructed);
+  }
+
+  eval(scope, "gc()").unwrap();
+  assert!(weak.is_empty());
+}
+
+#[test]
 fn local_handle_deref() {
   let _setup_guard = setup();
   let isolate = &mut v8::Isolate::new(Default::default());
