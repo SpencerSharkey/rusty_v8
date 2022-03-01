@@ -658,12 +658,6 @@ impl<T> Weak<T> {
     }
   }
 
-  pub fn unset_finalizer(&mut self) {
-    if let Some(data) = &self.data {
-      data.finalizer.take();
-    }
-  }
-
   // Finalization callbacks.
 
   extern "C" fn first_pass_callback(wci: *const WeakCallbackInfo) {
@@ -732,9 +726,9 @@ impl<T> Drop for Weak<T> {
       } else if let Some(weak_data) = self.data.take() {
         // The second pass callback takes the finalizer, so if there is one,
         // the second pass hasn't yet run, and WeakData will have to be alive.
+        // In that case we leak the WeakData but take the finalizer.
         let finalizer = weak_data.finalizer.take();
         if finalizer.is_some() {
-          weak_data.finalizer.set(finalizer);
           weak_data.weak_dropped.set(true);
           Box::leak(weak_data);
         }
