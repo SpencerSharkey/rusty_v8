@@ -367,6 +367,11 @@ void v8__Global__Reset(const v8::Data* data) {
   global.Reset();
 }
 
+v8::Isolate* v8__WeakCallbackInfo__GetIsolate(
+    const v8::WeakCallbackInfo<void>* self) {
+  return self->GetIsolate();
+}
+
 void* v8__WeakCallbackInfo__GetParameter(
     const v8::WeakCallbackInfo<void>* self) {
   return self->GetParameter();

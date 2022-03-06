@@ -26,6 +26,9 @@ extern "C" {
     callback: extern "C" fn(*const WeakCallbackInfo),
   ) -> *const Data;
   fn v8__Global__Reset(data: *const Data);
+  fn v8__WeakCallbackInfo__GetIsolate(
+    this: *const WeakCallbackInfo,
+  ) -> *mut Isolate;
   fn v8__WeakCallbackInfo__GetParameter(
     this: *const WeakCallbackInfo,
   ) -> *mut c_void;
@@ -497,17 +500,18 @@ impl<T> Weak<T> {
   ) -> Self {
     let HandleInfo { data, host } = handle.get_handle_info();
     host.assert_match_isolate(isolate);
-    Self::new_raw(isolate, data, Some(finalizer))
+    let finalizer_id = isolate.get_finalizer_map_mut().add(finalizer);
+    Self::new_raw(isolate, data, Some(finalizer_id))
   }
 
   fn new_raw(
     isolate: *mut Isolate,
     data: NonNull<T>,
-    finalizer: Option<Box<dyn FnOnce()>>,
+    finalizer_id: Option<FinalizerId>,
   ) -> Self {
     let weak_data = Box::new(WeakData {
       pointer: Default::default(),
-      finalizer: Cell::new(finalizer),
+      finalizer_id,
       weak_dropped: Cell::new(false),
     });
     let data = data.cast().as_ptr();
@@ -548,13 +552,20 @@ impl<T> Weak<T> {
 
   fn clone_raw(&self, finalizer: Option<Box<dyn FnOnce()>>) -> Self {
     if let Some(data) = self.get_pointer() {
-      Self::new_raw(
-        // SAFETY: We're in the isolate's thread, because Weak<T> isn't Send or
-        // Sync.
-        unsafe { self.isolate_handle.get_isolate_ptr() },
-        data,
-        finalizer,
-      )
+      // SAFETY: We're in the isolate's thread, because Weak<T> isn't Send or
+      // Sync.
+      let isolate_ptr = unsafe { self.isolate_handle.get_isolate_ptr() };
+      if isolate_ptr.is_null() {
+        unreachable!("Isolate was dropped but weak handle wasn't reset.");
+      }
+
+      let finalizer_id = if let Some(finalizer) = finalizer {
+        let isolate = unsafe { &mut *isolate_ptr };
+        Some(isolate.get_finalizer_map_mut().add(finalizer))
+      } else {
+        None
+      };
+      Self::new_raw(isolate_ptr, data, finalizer_id)
     } else {
       Weak {
         data: None,
@@ -592,11 +603,18 @@ impl<T> Weak<T> {
   /// GC'd.
   pub fn into_raw(mut self) -> Option<NonNull<WeakData<T>>> {
     if let Some(data) = self.data.take() {
-      let has_finalizer = {
-        let finalizer = data.finalizer.take();
-        let has_finalizer = finalizer.is_some();
-        data.finalizer.set(finalizer);
-        has_finalizer
+      let has_finalizer = if let Some(finalizer_id) = data.finalizer_id {
+        // SAFETY: We're in the isolate's thread because Weak isn't Send or Sync
+        let isolate_ptr = unsafe { self.isolate_handle.get_isolate_ptr() };
+        if isolate_ptr.is_null() {
+          // Disposed isolates have no finalizers.
+          false
+        } else {
+          let isolate = unsafe { &mut *isolate_ptr };
+          isolate.get_finalizer_map().map.contains_key(&finalizer_id)
+        }
+      } else {
+        false
       };
 
       if data.pointer.get().is_none() && !has_finalizer {
@@ -674,9 +692,8 @@ impl<T> Weak<T> {
       v8__Global__Reset(data.cast().as_ptr());
     }
 
-    // Only set the second pass callback if there's a finalizer.
-    if let Some(finalizer) = weak_data.finalizer.take() {
-      weak_data.finalizer.set(Some(finalizer));
+    // Only set the second pass callback if there could be a finalizer.
+    if weak_data.finalizer_id.is_some() {
       unsafe {
         v8__WeakCallbackInfo__SetSecondPassCallback(
           wci,
@@ -687,6 +704,10 @@ impl<T> Weak<T> {
   }
 
   extern "C" fn second_pass_callback(wci: *const WeakCallbackInfo) {
+    // SAFETY: This callback is guaranteed by V8 to be called in the isolate's
+    // thread before the isolate is disposed.
+    let isolate = unsafe { &mut *v8__WeakCallbackInfo__GetIsolate(wci) };
+
     // SAFETY: This callback might be called well after the first pass callback,
     // which means the corresponding Weak might have been dropped. In Weak's
     // Drop impl we make sure that if the second pass callback hasn't yet run, the
@@ -696,7 +717,10 @@ impl<T> Weak<T> {
       let ptr = v8__WeakCallbackInfo__GetParameter(wci);
       &*(ptr as *mut WeakData<T>)
     };
-    if let Some(finalizer) = weak_data.finalizer.take() {
+    let finalizer_id = weak_data.finalizer_id.unwrap();
+    if let Some(finalizer) =
+      isolate.get_finalizer_map_mut().map.remove(&finalizer_id)
+    {
       finalizer();
     }
 
@@ -718,20 +742,33 @@ impl<T> Clone for Weak<T> {
 
 impl<T> Drop for Weak<T> {
   fn drop(&mut self) {
-    unsafe {
-      if let Some(data) = self.get_pointer() {
-        // If the pointer is not None, the first pass callback hasn't been
-        // called yet, and resetting will prevent it from being called.
-        v8__Global__Reset(data.cast().as_ptr());
-      } else if let Some(weak_data) = self.data.take() {
-        // The second pass callback takes the finalizer, so if there is one,
-        // the second pass hasn't yet run, and WeakData will have to be alive.
-        // In that case we leak the WeakData but take the finalizer.
-        let finalizer = weak_data.finalizer.take();
-        if finalizer.is_some() {
-          weak_data.weak_dropped.set(true);
-          Box::leak(weak_data);
+    // Returns whether the finalizer existed.
+    let remove_finalizer = |finalizer_id: Option<FinalizerId>| -> bool {
+      if let Some(finalizer_id) = finalizer_id {
+        // SAFETY: We're in the isolate's thread because `Weak` isn't Send or Sync.
+        let isolate_ptr = unsafe { self.isolate_handle.get_isolate_ptr() };
+        if !isolate_ptr.is_null() {
+          let isolate = unsafe { &mut *isolate_ptr };
+          let finalizer =
+            isolate.get_finalizer_map_mut().map.remove(&finalizer_id);
+          return finalizer.is_some();
         }
+      }
+      false
+    };
+
+    if let Some(data) = self.get_pointer() {
+      // If the pointer is not None, the first pass callback hasn't been
+      // called yet, and resetting will prevent it from being called.
+      unsafe { v8__Global__Reset(data.cast().as_ptr()) };
+      remove_finalizer(self.data.as_ref().unwrap().finalizer_id);
+    } else if let Some(weak_data) = self.data.take() {
+      // The second pass callback removes the finalizer, so if there is one,
+      // the second pass hasn't yet run, and WeakData will have to be alive.
+      // In that case we leak the WeakData but remove the finalizer.
+      if remove_finalizer(weak_data.finalizer_id) {
+        weak_data.weak_dropped.set(true);
+        Box::leak(weak_data);
       }
     }
   }
@@ -787,7 +824,7 @@ where
 /// both the [`Weak`] and the finalization callbacks.
 pub struct WeakData<T> {
   pointer: Cell<Option<NonNull<T>>>,
-  finalizer: Cell<Option<Box<dyn FnOnce()>>>,
+  finalizer_id: Option<FinalizerId>,
   weak_dropped: Cell<bool>,
 }
 
@@ -801,3 +838,21 @@ impl<T> std::fmt::Debug for WeakData<T> {
 
 #[repr(C)]
 struct WeakCallbackInfo(Opaque);
+
+type FinalizerId = usize;
+
+#[derive(Default)]
+pub(crate) struct FinalizerMap {
+  map: std::collections::HashMap<FinalizerId, Box<dyn FnOnce()>>,
+  next_id: FinalizerId,
+}
+
+impl FinalizerMap {
+  pub(crate) fn add(&mut self, finalizer: Box<dyn FnOnce()>) -> FinalizerId {
+    let id = self.next_id;
+    // TODO: Overflow.
+    self.next_id += 1;
+    self.map.insert(id, finalizer);
+    id
+  }
+}

@@ -1,5 +1,6 @@
 // Copyright 2019-2021 the Deno authors. All rights reserved. MIT license.
 use crate::function::FunctionCallbackInfo;
+use crate::handle::FinalizerMap;
 use crate::isolate_create_params::raw;
 use crate::isolate_create_params::CreateParams;
 use crate::promise::PromiseRejectMessage;
@@ -372,6 +373,14 @@ impl Isolate {
     unsafe {
       &mut *(v8__Isolate__GetData(self, Self::ANNEX_SLOT) as *mut IsolateAnnex)
     }
+  }
+
+  pub(crate) fn get_finalizer_map(&self) -> &FinalizerMap {
+    &self.get_annex().finalizer_map
+  }
+
+  pub(crate) fn get_finalizer_map_mut(&mut self) -> &mut FinalizerMap {
+    &mut self.get_annex_mut().finalizer_map
   }
 
   fn get_annex_arc(&self) -> Arc<IsolateAnnex> {
@@ -763,6 +772,7 @@ impl Isolate {
 pub(crate) struct IsolateAnnex {
   create_param_allocations: Box<dyn Any>,
   slots: HashMap<TypeId, RawSlot, BuildTypeIdHasher>,
+  finalizer_map: FinalizerMap,
   // The `isolate` and `isolate_mutex` fields are there so an `IsolateHandle`
   // (which may outlive the isolate itself) can determine whether the isolate
   // is still alive, and if so, get a reference to it. Safety rules:
@@ -782,6 +792,7 @@ impl IsolateAnnex {
     Self {
       create_param_allocations,
       slots: HashMap::default(),
+      finalizer_map: FinalizerMap::default(),
       isolate,
       isolate_mutex: Mutex::new(()),
     }
