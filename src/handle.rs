@@ -496,7 +496,7 @@ impl<T> Weak<T> {
   pub fn with_finalizer(
     isolate: &mut Isolate,
     handle: impl Handle<Data = T>,
-    finalizer: Box<dyn FnOnce()>,
+    finalizer: Box<dyn FnOnce(&mut Isolate)>,
   ) -> Self {
     let HandleInfo { data, host } = handle.get_handle_info();
     host.assert_match_isolate(isolate);
@@ -546,11 +546,17 @@ impl<T> Weak<T> {
   ///
   /// Note that if this handle is empty (its value has already been GC'd), the
   /// finalization callback will never run.
-  pub fn clone_with_finalizer(&self, finalizer: Box<dyn FnOnce()>) -> Self {
+  pub fn clone_with_finalizer(
+    &self,
+    finalizer: Box<dyn FnOnce(&mut Isolate)>,
+  ) -> Self {
     self.clone_raw(Some(finalizer))
   }
 
-  fn clone_raw(&self, finalizer: Option<Box<dyn FnOnce()>>) -> Self {
+  fn clone_raw(
+    &self,
+    finalizer: Option<Box<dyn FnOnce(&mut Isolate)>>,
+  ) -> Self {
     if let Some(data) = self.get_pointer() {
       // SAFETY: We're in the isolate's thread, because Weak<T> isn't Send or
       // Sync.
@@ -721,7 +727,7 @@ impl<T> Weak<T> {
     if let Some(finalizer) =
       isolate.get_finalizer_map_mut().map.remove(&finalizer_id)
     {
-      finalizer();
+      finalizer(isolate);
     }
 
     if weak_data.weak_dropped.get() {
@@ -843,12 +849,15 @@ type FinalizerId = usize;
 
 #[derive(Default)]
 pub(crate) struct FinalizerMap {
-  map: std::collections::HashMap<FinalizerId, Box<dyn FnOnce()>>,
+  map: std::collections::HashMap<FinalizerId, Box<dyn FnOnce(&mut Isolate)>>,
   next_id: FinalizerId,
 }
 
 impl FinalizerMap {
-  pub(crate) fn add(&mut self, finalizer: Box<dyn FnOnce()>) -> FinalizerId {
+  pub(crate) fn add(
+    &mut self,
+    finalizer: Box<dyn FnOnce(&mut Isolate)>,
+  ) -> FinalizerId {
     let id = self.next_id;
     // TODO: Overflow.
     self.next_id += 1;

@@ -6295,7 +6295,7 @@ fn finalizers() {
       let scope = &mut v8::HandleScope::new(scope);
       let local = v8::Object::new(scope);
       let _ =
-        v8::Weak::with_finalizer(scope, &local, Box::new(|| unreachable!()));
+        v8::Weak::with_finalizer(scope, &local, Box::new(|_| unreachable!()));
     }
 
     let scope = &mut v8::HandleScope::new(scope);
@@ -6317,7 +6317,7 @@ fn finalizers() {
     let weak = Rc::new(v8::Weak::with_finalizer(
       scope,
       &local,
-      Box::new(move || {
+      Box::new(move |_| {
         let (weak, finalizer_called) = rx.try_recv().unwrap();
         finalizer_called.set(true);
         assert!(weak.is_empty());
@@ -6415,7 +6415,7 @@ fn weak_from_into_raw() {
         &local,
         Box::new({
           let finalizer_called = finalizer_called.clone();
-          move || {
+          move |_| {
             finalizer_called.set(true);
           }
         }),
@@ -6462,7 +6462,7 @@ fn weak_from_into_raw() {
         &local,
         Box::new({
           let finalizer_called = finalizer_called.clone();
-          move || {
+          move |_| {
             finalizer_called.set(true);
           }
         }),
