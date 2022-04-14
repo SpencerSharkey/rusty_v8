@@ -6484,3 +6484,44 @@ fn weak_from_into_raw() {
     assert!(weak2.is_empty());
   }
 }
+
+#[test]
+fn drop_weak_from_raw_in_finalizer() {
+  use std::cell::Cell;
+  use std::rc::Rc;
+
+  let _setup_guard = setup();
+
+  let isolate = &mut v8::Isolate::new(Default::default());
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  let weak_ptr = Rc::new(Cell::new(None));
+  let finalized = Rc::new(Cell::new(false));
+
+  {
+    let scope = &mut v8::HandleScope::new(scope);
+    let local = v8::Object::new(scope);
+    let weak = v8::Weak::with_finalizer(
+      scope,
+      &local,
+      Box::new({
+        let weak_ptr = weak_ptr.clone();
+        let finalized = finalized.clone();
+        move |isolate| {
+          let weak_ptr = weak_ptr.get().unwrap();
+          let weak: v8::Weak<v8::Object> =
+            unsafe { v8::Weak::from_raw(isolate, Some(weak_ptr)) };
+          drop(weak);
+          finalized.set(true);
+        }
+      }),
+    );
+    weak_ptr.set(weak.into_raw());
+  }
+
+  assert!(!finalized.get());
+  eval(scope, "gc()").unwrap();
+  assert!(finalized.get());
+}
