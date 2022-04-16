@@ -731,9 +731,18 @@ impl Isolate {
     annex.create_param_allocations = Box::new(());
     annex.slots.clear();
 
+    let finalizers = annex.finalizer_map.take_map();
+
     // Subtract one from the Arc<IsolateAnnex> reference count.
     Arc::from_raw(annex);
     self.set_data(0, null_mut());
+
+    // Call any remaining finalizers. Their corresponding weak pointers are now
+    // emptied because the isolate pointer has been set to null above (although
+    // the actual objects might not have been GC'd).
+    for (_, finalizer) in finalizers {
+      finalizer(self);
+    }
 
     // No test case in rusty_v8 show this, but there have been situations in
     // deno where dropping Annex before the states causes a segfault.

@@ -6364,10 +6364,17 @@ fn weak_from_global() {
 }
 
 #[test]
-fn weak_is_empty_after_dropping_isolate() {
+fn weak_after_dropping_isolate() {
+  use std::cell::Cell;
+  use std::rc::Rc;
+
   let _setup_guard = setup();
 
-  let weak = {
+  let finalized = Rc::new(Cell::new(false));
+
+  let (tx, rx) = std::sync::mpsc::channel::<Arc<v8::Weak<v8::Object>>>();
+
+  let (global, weak) = {
     let isolate = &mut v8::Isolate::new(Default::default());
     let scope = &mut v8::HandleScope::new(isolate);
     let context = v8::Context::new(scope);
@@ -6377,13 +6384,32 @@ fn weak_is_empty_after_dropping_isolate() {
       let object = v8::Object::new(scope);
       v8::Global::new(scope, object)
     };
-    let weak = v8::Weak::new(scope, &global);
+    let weak = v8::Weak::with_finalizer(
+      scope,
+      &global,
+      Box::new({
+        let finalized = finalized.clone();
+        move |_| {
+          finalized.set(true);
+          let weak = rx.recv().unwrap();
+          assert!(weak.is_empty());
+        }
+      }),
+    );
     assert!(!weak.is_empty());
 
-    weak
+    let weak = Arc::new(weak);
+    tx.send(weak.clone()).unwrap();
+
+    // We don't do anything with `global` in the outer scope; we return it so
+    // it's kept alive after the isolate is dropped.
+    (global, weak)
   };
 
   assert!(weak.is_empty());
+  assert!(finalized.get());
+
+  println!("{:?}", global);
 }
 
 #[test]
@@ -6483,6 +6509,16 @@ fn weak_from_into_raw() {
     assert!(weak1.is_empty());
     assert!(weak2.is_empty());
   }
+
+  // Leaking a Weak will not crash the isolate.
+  {
+    let scope = &mut v8::HandleScope::new(scope);
+    let local = v8::Object::new(scope);
+    v8::Weak::new(scope, local).into_raw();
+    v8::Weak::with_finalizer(scope, local, Box::new(|_| {})).into_raw();
+    eval(scope, "gc()").unwrap();
+  }
+  eval(scope, "gc()").unwrap();
 }
 
 #[test]
